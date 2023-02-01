@@ -1,6 +1,8 @@
 package moe.reimu.vdclient
 
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
 import androidx.appcompat.app.AppCompatActivity
@@ -95,7 +97,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, TcpTransport.T
         }
     }
 
-    fun configureCodec() {
+    private fun configureCodec() {
         val callback = object : MediaCodec.Callback() {
             override fun onInputBufferAvailable(codec: MediaCodec, bufferId: Int) {
                 val inputBuffer = codec.getInputBuffer(bufferId)!!
@@ -106,7 +108,13 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, TcpTransport.T
                 }
 
                 inputBuffer.put(packet.data)
-                codec.queueInputBuffer(bufferId, 0, inputBuffer.position(), packet.pts * 1000, 0)
+                codec.queueInputBuffer(
+                    bufferId,
+                    0,
+                    inputBuffer.position(),
+                    TimeUnit.MILLISECONDS.toMicros(packet.pts),
+                    0
+                )
             }
 
             override fun onOutputBufferAvailable(
@@ -115,6 +123,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, TcpTransport.T
                 if (streamStartNanoTime != null) {
                     val frameTimestamp = TimeUnit.MICROSECONDS.toNanos(info.presentationTimeUs)
                     val renderTimestamp = streamStartNanoTime!! + frameTimestamp
+
                     codec.releaseOutputBuffer(bufferId, renderTimestamp)
                 } else {
                     codec.releaseOutputBuffer(bufferId, true)
@@ -137,7 +146,33 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, TcpTransport.T
 
             Log.i(TAG, "Configuring codec")
 
-            val decoder = MediaCodec.createDecoderByType("video/avc")
+            // Try to select a low-latency decoder
+            var selectedCodecName: String? = null
+            for (codec in MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos) {
+                if (codec.isEncoder || !codec.supportedTypes.any { it.lowercase() == "video/avc" }) {
+                    // Not H.264 decoder
+                    continue
+                }
+
+                val caps = codec.getCapabilitiesForType("video/avc")
+                val hw =
+                    (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) && codec.isHardwareAccelerated
+                val ll =
+                    (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) && caps.isFeatureSupported(
+                        MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency
+                    )
+                if (hw && ll) {
+                    selectedCodecName = codec.name
+                }
+            }
+
+            val decoder = if (selectedCodecName != null) {
+                Log.i(TAG, "Using selected decoder $selectedCodecName")
+                MediaCodec.createByCodecName(selectedCodecName)
+            } else {
+                Log.i(TAG, "Using system decoder")
+                MediaCodec.createDecoderByType("video/avc")
+            }
             decoder.setCallback(callback)
             val format = MediaFormat.createVideoFormat("media/avc", 1920, 1080)
             for ((i, buf) in codecData.withIndex()) {
@@ -146,9 +181,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, TcpTransport.T
             if (Build.VERSION.SDK_INT >= 30) {
                 format.setFeatureEnabled(MediaFormat.KEY_LOW_LATENCY, true)
             }
-            if (Build.VERSION.SDK_INT >= 23) {
-                format.setInteger(MediaFormat.KEY_OPERATING_RATE, 240)
-            }
+            format.setInteger(MediaFormat.KEY_OPERATING_RATE, 1000)
+            format.setInteger(MediaFormat.KEY_PRIORITY, 0)
+
             decoder.configure(format, surface, null, 0)
             decoder.start()
         }

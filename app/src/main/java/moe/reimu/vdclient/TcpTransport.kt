@@ -41,12 +41,27 @@ class ReadThread(var socket: SocketChannel, private val callback: TcpTransport.T
     Thread() {
     companion object {
         const val DATA_BUFFER_MAX = 1024 * 1024 * 30
+        const val VIDEO_BUFFER_SIZE = 1024 * 500
+        const val VIDEO_BUFFER_COUNT = 60
     }
 
     var running = true
 
     private val headerAndSizeBuffer = allocateBuffer(4 + 4)
     private val dataBuffer = allocateBuffer(DATA_BUFFER_MAX)
+
+    private val videoBuffers : List<ByteBuffer>
+    private var videoBufferIndex = 0
+
+    init {
+        val buffers = mutableListOf<ByteBuffer>()
+
+        repeat(VIDEO_BUFFER_COUNT) {
+            buffers.add(allocateBuffer(VIDEO_BUFFER_SIZE))
+        }
+
+        videoBuffers = buffers
+    }
 
     override fun run() {
         while (running) {
@@ -60,16 +75,47 @@ class ReadThread(var socket: SocketChannel, private val callback: TcpTransport.T
     }
 
     private fun readPacket() {
+        headerAndSizeBuffer.clear()
+        dataBuffer.clear()
+
         while (headerAndSizeBuffer.hasRemaining()) {
             socket.read(headerAndSizeBuffer)
         }
         headerAndSizeBuffer.flip()
         val type = headerAndSizeBuffer.int
         val len = headerAndSizeBuffer.int
-        headerAndSizeBuffer.clear()
+
 
         if (len > DATA_BUFFER_MAX) {
             throw java.lang.Exception("Incoming packet is too large (> 30M)")
+        }
+
+        if (type == VideoPacket.ident) {
+            // 0, short circuit
+
+            // Read PTS
+            dataBuffer.limit(8)
+            while (dataBuffer.hasRemaining()) {
+                socket.read(dataBuffer)
+            }
+            dataBuffer.flip()
+
+            val pts = dataBuffer.long
+
+            // Read data
+            val videoBuffer = videoBuffers[videoBufferIndex]
+            videoBuffer.clear()
+            videoBuffer.limit(len - 8)
+
+            while (videoBuffer.hasRemaining()) {
+                socket.read(videoBuffer)
+            }
+            videoBuffer.rewind()
+            callback.onPacket(VideoPacket(pts, videoBuffer))
+
+            videoBufferIndex = (videoBufferIndex + 1) % VIDEO_BUFFER_COUNT
+
+            return
         }
 
         dataBuffer.limit(len)
@@ -79,10 +125,6 @@ class ReadThread(var socket: SocketChannel, private val callback: TcpTransport.T
         dataBuffer.flip()
 
         val packet = when (type) {
-            // 0
-            VideoPacket.ident -> {
-                VideoPacket(dataBuffer)
-            }
             // 1
             AudioPacket.ident -> {
                 AudioPacket(dataBuffer)
@@ -106,7 +148,7 @@ class ReadThread(var socket: SocketChannel, private val callback: TcpTransport.T
             callback.onPacket(packet)
         }
 
-        dataBuffer.clear()
+
     }
 
     fun stopRunning() {
