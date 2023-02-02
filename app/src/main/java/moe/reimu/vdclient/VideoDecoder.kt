@@ -83,10 +83,12 @@ class VideoDecoder {
             }
         }
 
-        override fun onError(p0: MediaCodec, p1: MediaCodec.CodecException) {
+        override fun onError(p0: MediaCodec, p1: CodecException) {
+            Log.e(TAG, "Media codec error", p1)
         }
 
         override fun onOutputFormatChanged(p0: MediaCodec, p1: MediaFormat) {
+            Log.i(TAG, "onOutputFormatChanged")
         }
     }
 

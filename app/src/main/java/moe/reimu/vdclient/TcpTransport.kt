@@ -134,9 +134,16 @@ class ReadThread(var socket: SocketChannel, private val callback: TcpTransport.T
                 TimestampPacket(dataBuffer)
             }
             // 3
-            CodecDataPacket.ident -> {
-                Log.i(TAG, "CodecDataPacket")
-                CodecDataPacket(dataBuffer)
+            ConfigurePacket.ident -> {
+                ConfigurePacket(dataBuffer)
+            }
+            // 4
+            CursorPositionPacket.ident -> {
+                CursorPositionPacket(dataBuffer)
+            }
+            // 5
+            CursorImagePacket.ident -> {
+                CursorImagePacket(dataBuffer)
             }
             else -> {
                 Log.w(TAG, "Unrecognized packet type: $type")
