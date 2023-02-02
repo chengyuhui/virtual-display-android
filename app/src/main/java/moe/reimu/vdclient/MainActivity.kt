@@ -23,8 +23,10 @@ import java.nio.ByteBuffer
 import java.util.*
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.Condition
 import java.util.concurrent.locks.Lock
 import java.util.concurrent.locks.ReentrantLock
+import kotlin.collections.ArrayDeque
 
 class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, TcpTransport.TransportCallback {
     private var transport: TcpTransport? = null
@@ -36,13 +38,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, TcpTransport.T
     private var codecData: CodecDataPacket? = null
 
     private var outputSurface: Surface? = null
-    private var decoderLock = Object()
-    private var decoder: MediaCodec? = null
+    private val decoder = VideoDecoder()
 
-    //    private val videoBuffersLock = Object()
-    private val videoBuffers = ArrayBlockingQueue<VideoPacket>(30)
-
-    private var streamStartNanoTime: Long? = null
+    private var streamStartNanoTime: Long = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -55,6 +53,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, TcpTransport.T
         window.setSustainedPerformanceMode(true)
 
         transport = TcpTransport(InetSocketAddress("127.0.0.1", 9867), this)
+
+        decoder.setLatencyListener {
+            runOnUiThread {
+                binding.latencyTextView.text = "Latency: $it ms"
+            }
+        }
     }
 
     override fun onResume() {
@@ -79,12 +83,14 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, TcpTransport.T
     override fun surfaceDestroyed(p0: SurfaceHolder) {
         Log.i(TAG, "Surface has been destroyed")
         outputSurface = null
+        decoder.stop()
     }
 
     override fun onPacket(packet: Packet) {
         when (packet) {
             is VideoPacket -> {
-                videoBuffers.offer(packet, 100, TimeUnit.MILLISECONDS)
+                val ptsUs = TimeUnit.NANOSECONDS.toMicros(streamStartNanoTime) + TimeUnit.MILLISECONDS.toMicros(packet.pts)
+                decoder.processFrame(packet.data, ptsUs)
             }
             is CodecDataPacket -> {
                 codecData = packet
@@ -98,94 +104,18 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, TcpTransport.T
     }
 
     private fun configureCodec() {
-        val callback = object : MediaCodec.Callback() {
-            override fun onInputBufferAvailable(codec: MediaCodec, bufferId: Int) {
-                val inputBuffer = codec.getInputBuffer(bufferId)!!
-                val packet = videoBuffers.poll(100, TimeUnit.MILLISECONDS) ?: return
+        decoder.configure(
+            "video/avc",
+            1920,
+            1080,
+            outputSurface ?: return,
+            codecData?.data ?: return
+        )
+        decoder.start()
+    }
 
-                if (packet.data.remaining() > inputBuffer.remaining()) {
-                    return
-                }
-
-                inputBuffer.put(packet.data)
-                codec.queueInputBuffer(
-                    bufferId,
-                    0,
-                    inputBuffer.position(),
-                    TimeUnit.MILLISECONDS.toMicros(packet.pts),
-                    0
-                )
-            }
-
-            override fun onOutputBufferAvailable(
-                codec: MediaCodec, bufferId: Int, info: MediaCodec.BufferInfo
-            ) {
-                if (streamStartNanoTime != null) {
-                    val frameTimestamp = TimeUnit.MICROSECONDS.toNanos(info.presentationTimeUs)
-                    val renderTimestamp = streamStartNanoTime!! + frameTimestamp
-
-                    codec.releaseOutputBuffer(bufferId, renderTimestamp)
-                } else {
-                    codec.releaseOutputBuffer(bufferId, true)
-                }
-            }
-
-            override fun onError(p0: MediaCodec, p1: MediaCodec.CodecException) {
-                Log.e(TAG, "Codec exception", p1)
-            }
-
-            override fun onOutputFormatChanged(p0: MediaCodec, p1: MediaFormat) {
-            }
-        }
-
-        synchronized(decoderLock) {
-            decoder?.release()
-
-            val codecData = codecData?.data ?: return
-            val surface = outputSurface ?: return
-
-            Log.i(TAG, "Configuring codec")
-
-            // Try to select a low-latency decoder
-            var selectedCodecName: String? = null
-            for (codec in MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos) {
-                if (codec.isEncoder || !codec.supportedTypes.any { it.lowercase() == "video/avc" }) {
-                    // Not H.264 decoder
-                    continue
-                }
-
-                val caps = codec.getCapabilitiesForType("video/avc")
-                val hw =
-                    (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) && codec.isHardwareAccelerated
-                val ll =
-                    (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) && caps.isFeatureSupported(
-                        MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency
-                    )
-                if (hw && ll) {
-                    selectedCodecName = codec.name
-                }
-            }
-
-            val decoder = if (selectedCodecName != null) {
-                Log.i(TAG, "Using selected decoder $selectedCodecName")
-                MediaCodec.createByCodecName(selectedCodecName)
-            } else {
-                Log.i(TAG, "Using system decoder")
-                MediaCodec.createDecoderByType("video/avc")
-            }
-            decoder.setCallback(callback)
-            val format = MediaFormat.createVideoFormat("media/avc", 1920, 1080)
-            for ((i, buf) in codecData.withIndex()) {
-                format.setByteBuffer("csd-$i", buf)
-            }
-            if (Build.VERSION.SDK_INT >= 30) {
-                format.setFeatureEnabled(MediaFormat.KEY_LOW_LATENCY, true)
-            }
-            format.setInteger(MediaFormat.KEY_OPERATING_RATE, 1000)
-            format.setInteger(MediaFormat.KEY_PRIORITY, 0)
-
-            decoder.configure(format, surface, null, 0)
-            decoder.start()
-        }
+    override fun onDestroy() {
+        super.onDestroy()
+        decoder.close()
     }
 }
